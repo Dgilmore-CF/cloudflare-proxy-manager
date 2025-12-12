@@ -229,11 +229,28 @@ GitHub Actions CI is configured in `.github/workflows/ci.yml` and runs tests on 
    ```
 5. **Important**: Add `.env` and `proxy_state.json` to your `.gitignore` file to prevent committing sensitive information.
 
+## Troubleshooting
+
+### Warning: "No account ID specified"
+- **Cause**: Environment variable for account ID is missing
+- **Impact**: Script will operate on all zones accessible by token
+- **Solution**: Add `CLOUDFLARE_ACCOUNT_ID_ACCOUNTNAME` to your `.env` file
+
+### Error: "Configured account ID not found in accessible accounts"
+- **Cause**: The account ID doesn't match any account the token can access
+- **Impact**: Script may not find expected zones
+- **Solution**: Verify the account ID is correct and the token has access to that account
+
+### No zones retrieved with account ID configured
+- **Cause**: Token may not have access to that specific account
+- **Solution**: Run `verify` command to see which accounts are accessible
+
 ## Security Considerations
 
 - Never commit your Cloudflare API tokens to version control
 - The `proxy_state.json` file contains information about your DNS records; keep it secure
 - Use the principle of least privilege when creating API tokens
+- Account IDs are not sensitive secrets, but should still be kept in `.env`
 
 ## License
 

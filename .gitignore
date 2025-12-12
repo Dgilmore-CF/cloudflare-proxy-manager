@@ -30,6 +30,9 @@ wheels/
 logs/
 *.log
 
+# Reports
+reports/
+
 # Virtual Environment
 venv/
 env/
