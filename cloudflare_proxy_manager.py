@@ -8,9 +8,12 @@ Can disable/enable proxy for all hostnames and maintain state between runs.
 import os
 import json
 import logging
+import csv
+import re
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cloudflare
 from dotenv import load_dotenv
@@ -107,15 +110,115 @@ class CloudflareProxyManager:
             
         return cloudflare.CloudFlare(token=self.accounts[account_name]["token"])
     
+    def _write_report_files(self, report_dir: Path, results: Dict[str, Any], prefix: str) -> None:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+        report_json = report_dir / f"{prefix}_{ts}.json"
+        with open(report_json, "w") as f:
+            json.dump(results, f, indent=2)
+
+        changes = results.get("changes", [])
+        if changes:
+            report_csv = report_dir / f"{prefix}_{ts}.csv"
+            fieldnames = sorted({k for row in changes for k in row.keys()})
+            with open(report_csv, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(changes)
+
+        report_md = report_dir / f"{prefix}_{ts}.md"
+        with open(report_md, "w") as f:
+            f.write(f"# Cloudflare Proxy Manager Report\n\n")
+            f.write(f"Generated: {datetime.utcnow().isoformat()}Z\n\n")
+            f.write(f"Action: {prefix}\n\n")
+            f.write(f"Total changes: {results.get('total_changes', results.get('total_restored', 0))}\n\n")
+            f.write("## Accounts\n\n")
+            for account_name, account_result in results.get("accounts", {}).items():
+                f.write(f"- {account_name}: {json.dumps(account_result)}\n")
+            if changes:
+                f.write("\n## First 50 Changes\n\n")
+                for row in changes[:50]:
+                    f.write(f"- {row.get('record_name')} ({row.get('record_type')}) in {row.get('zone')} [{row.get('action')}]\n")
+
+    def _cf_call(self, fn, *, max_retries: int = 5, base_sleep_seconds: float = 1.0):
+        attempt = 0
+        while True:
+            try:
+                return fn()
+            except Exception as e:
+                attempt += 1
+                message = str(e)
+
+                retryable = False
+                status_code = getattr(e, "code", None)
+                if status_code in (429, 500, 502, 503, 504):
+                    retryable = True
+                if any(s in message for s in ("429", "rate limit", "timeout", "timed out", "connection")):
+                    retryable = True
+
+                if not retryable or attempt > max_retries:
+                    raise
+
+                sleep_for = base_sleep_seconds * (2 ** (attempt - 1))
+                self.logger.warning(
+                    f"Retrying Cloudflare API call after error (attempt {attempt}/{max_retries}): {message}",
+                    extra={"attempt": attempt, "max_retries": max_retries}
+                )
+                time.sleep(min(sleep_for, 30.0))
+
+    def _paginate_get(self, getter, *, params: Optional[Dict[str, Any]] = None, per_page: int = 1000, max_retries: int = 5) -> List[Dict[str, Any]]:
+        params = dict(params or {})
+        page = 1
+        out: List[Dict[str, Any]] = []
+
+        while True:
+            page_params = dict(params)
+            page_params.update({"page": page, "per_page": per_page})
+
+            resp = self._cf_call(lambda: getter(page_params), max_retries=max_retries)
+
+            if isinstance(resp, dict) and "result" in resp:
+                items = resp.get("result") or []
+                out.extend(items)
+                info = resp.get("result_info") or {}
+                total_pages = info.get("total_pages")
+                if total_pages is not None and page >= int(total_pages):
+                    break
+                if not items:
+                    break
+                page += 1
+                continue
+
+            if isinstance(resp, list):
+                out.extend(resp)
+                if len(resp) < per_page:
+                    break
+                page += 1
+                continue
+
+            break
+
+        return out
+
+    def _matches_name_filters(self, name: str, include: Optional[str], exclude: Optional[str]) -> bool:
+        if include:
+            if not re.search(include, name):
+                return False
+        if exclude:
+            if re.search(exclude, name):
+                return False
+        return True
+    
     def verify_account(self, account_name: str) -> Dict:
         """Verify account access and return account information."""
         cf = self._get_cloudflare_client(account_name)
         try:
             # Get user info to verify token
-            user = cf.user.get()
+            user = self._cf_call(lambda: cf.user.get())
             
             # Get accounts accessible by this token
-            accounts = cf.accounts.get()
+            accounts = self._cf_call(lambda: cf.accounts.get())
             
             account_info = {
                 "account_name": account_name,
@@ -159,13 +262,13 @@ class CloudflareProxyManager:
                 account_id = self.accounts[account_name]["account_id"]
                 # Filter zones by account ID
                 params = {"account.id": account_id}
-                zones = cf.zones.get(params=params)
+                zones = self._paginate_get(lambda p: cf.zones.get(params=p), params=params)
                 self.logger.info(
                     f"Retrieved {len(zones)} zones for account '{account_name}' (ID: {account_id})"
                 )
             else:
                 # Get all zones accessible by token
-                zones = cf.zones.get()
+                zones = self._paginate_get(lambda p: cf.zones.get(params=p))
                 self.logger.warning(
                     f"Retrieved {len(zones)} zones for account '{account_name}' (no account ID filter applied)"
                 )
@@ -179,7 +282,7 @@ class CloudflareProxyManager:
         """Get all DNS records for a zone."""
         cf = self._get_cloudflare_client(account_name)
         try:
-            return cf.zones.dns_records.get(zone_id)
+            return self._paginate_get(lambda p: cf.zones.dns_records.get(zone_id, params=p))
         except Exception as e:
             self.logger.error(f"Error fetching DNS records for zone {zone_id}: {str(e)}")
             return []
@@ -194,21 +297,30 @@ class CloudflareProxyManager:
         """Update the proxy status of a DNS record."""
         cf = self._get_cloudflare_client(account_name)
         try:
-            record = cf.zones.dns_records.get(zone_id, record_id)
+            record = self._cf_call(lambda: cf.zones.dns_records.get(zone_id, record_id))
             if record["proxied"] != proxied:
                 record["proxied"] = proxied
-                cf.zones.dns_records.put(zone_id, record_id, data=record)
+                self._cf_call(lambda: cf.zones.dns_records.put(zone_id, record_id, data=record))
                 return True
             return False
         except Exception as e:
             self.logger.error(f"Error updating record {record_id} in zone {zone_id}: {str(e)}")
             return False
     
-    def scan_and_disable_proxies(self, dry_run: bool = False) -> Dict:
+    def scan_and_disable_proxies(
+        self,
+        dry_run: bool = False,
+        selected_accounts: Optional[List[str]] = None,
+        selected_zones: Optional[List[str]] = None,
+        include: Optional[str] = None,
+        exclude: Optional[str] = None,
+    ) -> Dict:
         """Scan all zones and disable proxies, saving the original state."""
-        results = {"accounts": {}, "total_changes": 0, "dry_run": dry_run}
+        results: Dict[str, Any] = {"accounts": {}, "total_changes": 0, "dry_run": dry_run, "changes": []}
         
         for account_name in self.accounts:
+            if selected_accounts and account_name not in selected_accounts:
+                continue
             account_results = {"zones_processed": 0, "records_processed": 0, "records_modified": 0, "errors": 0}
             results["accounts"][account_name] = account_results
             
@@ -220,6 +332,8 @@ class CloudflareProxyManager:
                 console.print(f"[dim]Account ID: {account_id}[/]")
             
             zones = self.get_zones(account_name)
+            if selected_zones:
+                zones = [z for z in zones if z.get("name") in selected_zones or z.get("id") in selected_zones]
             
             with Progress() as progress:
                 task = progress.add_task(f"Scanning {len(zones)} zones...", total=len(zones))
@@ -242,6 +356,8 @@ class CloudflareProxyManager:
                             
                         record_id = record["id"]
                         record_name = record["name"]
+                        if not self._matches_name_filters(record_name, include, exclude):
+                            continue
                         account_results["records_processed"] += 1
                         
                         # Save original state if not already saved
@@ -266,6 +382,20 @@ class CloudflareProxyManager:
                                     record_state["modified"] = True
                                     account_results["records_modified"] += 1
                                     results["total_changes"] += 1
+                                    results["changes"].append({
+                                        "action": "disable_proxy",
+                                        "account": account_name,
+                                        "account_id": self.accounts[account_name].get("account_id", "N/A"),
+                                        "zone": zone_name,
+                                        "zone_id": zone_id,
+                                        "record_id": record_id,
+                                        "record_name": record_name,
+                                        "record_type": record["type"],
+                                        "content": record["content"],
+                                        "proxied_before": True,
+                                        "proxied_after": False,
+                                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                                    })
                                     self.logger.info(
                                         f"Disabled proxy for {record_name} ({record['type']} {record['content']})",
                                         extra={
@@ -282,6 +412,20 @@ class CloudflareProxyManager:
                                 # In dry run mode, just count the potential changes
                                 account_results["records_modified"] += 1
                                 results["total_changes"] += 1
+                                results["changes"].append({
+                                    "action": "would_disable_proxy",
+                                    "account": account_name,
+                                    "account_id": self.accounts[account_name].get("account_id", "N/A"),
+                                    "zone": zone_name,
+                                    "zone_id": zone_id,
+                                    "record_id": record_id,
+                                    "record_name": record_name,
+                                    "record_type": record["type"],
+                                    "content": record["content"],
+                                    "proxied_before": True,
+                                    "proxied_after": False,
+                                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                                })
                                 self.logger.info(
                                     f"[DRY RUN] Would disable proxy for {record_name} ({record['type']} {record['content']})",
                                     extra={
@@ -303,15 +447,24 @@ class CloudflareProxyManager:
         
         return results
     
-    def restore_proxies(self, dry_run: bool = False) -> Dict:
+    def restore_proxies(
+        self,
+        dry_run: bool = False,
+        selected_accounts: Optional[List[str]] = None,
+        selected_zones: Optional[List[str]] = None,
+        include: Optional[str] = None,
+        exclude: Optional[str] = None,
+    ) -> Dict:
         """Restore proxies based on saved state."""
         if not self.state_file.exists():
             self.logger.error("No state file found. Cannot restore proxies.")
             return {"error": "No state file found. Cannot restore proxies."}
         
-        results = {"accounts": {}, "total_restored": 0, "dry_run": dry_run}
+        results: Dict[str, Any] = {"accounts": {}, "total_restored": 0, "dry_run": dry_run, "changes": []}
         
         for account_name, account_data in self.state.get("accounts", {}).items():
+            if selected_accounts and account_name not in selected_accounts:
+                continue
             if account_name not in self.accounts:
                 self.logger.warning(f"Account {account_name} not found in current configuration. Skipping.")
                 continue
@@ -333,11 +486,18 @@ class CloudflareProxyManager:
                 for zone_id, zone_data in zones:
                     if zone_id == "zone_name":  # Skip metadata
                         continue
+
+                    if selected_zones and (zone_data.get("zone_name") not in selected_zones and zone_id not in selected_zones):
+                        progress.update(task, advance=1)
+                        continue
                         
                     zone_name = zone_data["zone_name"]
                     account_results["zones_processed"] += 1
                     
                     for record_id, record_data in zone_data.get("records", {}).items():
+                        record_name = record_data.get("name", "")
+                        if not self._matches_name_filters(record_name, include, exclude):
+                            continue
                         if record_data.get("modified") and record_data.get("proxied"):
                             if not dry_run:
                                 try:
@@ -348,6 +508,20 @@ class CloudflareProxyManager:
                                         record_data["modified"] = False
                                         account_results["records_restored"] += 1
                                         results["total_restored"] += 1
+                                        results["changes"].append({
+                                            "action": "restore_proxy",
+                                            "account": account_name,
+                                            "account_id": self.accounts.get(account_name, {}).get("account_id", "N/A"),
+                                            "zone": zone_name,
+                                            "zone_id": zone_id,
+                                            "record_id": record_id,
+                                            "record_name": record_data.get("name"),
+                                            "record_type": record_data.get("type"),
+                                            "content": record_data.get("content"),
+                                            "proxied_before": False,
+                                            "proxied_after": True,
+                                            "timestamp": datetime.utcnow().isoformat() + "Z",
+                                        })
                                         self.logger.info(
                                             f"Restored proxy for {record_data['name']} ({record_data['type']} {record_data['content']})",
                                             extra={
@@ -375,6 +549,20 @@ class CloudflareProxyManager:
                                 # Dry run mode
                                 account_results["records_restored"] += 1
                                 results["total_restored"] += 1
+                                results["changes"].append({
+                                    "action": "would_restore_proxy",
+                                    "account": account_name,
+                                    "account_id": self.accounts.get(account_name, {}).get("account_id", "N/A"),
+                                    "zone": zone_name,
+                                    "zone_id": zone_id,
+                                    "record_id": record_id,
+                                    "record_name": record_data.get("name"),
+                                    "record_type": record_data.get("type"),
+                                    "content": record_data.get("content"),
+                                    "proxied_before": False,
+                                    "proxied_after": True,
+                                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                                })
                                 self.logger.info(
                                     f"[DRY RUN] Would restore proxy for {record_data['name']} ({record_data['type']} {record_data['content']})",
                                     extra={
@@ -407,6 +595,19 @@ def main():
     parser = argparse.ArgumentParser(description="Manage Cloudflare proxy settings across multiple accounts")
     subparsers = parser.add_subparsers(dest="command", required=True, help="Command to execute")
     
+    def _split_multi(v: Optional[str]) -> Optional[List[str]]:
+        if not v:
+            return None
+        parts = [p.strip() for p in v.split(",") if p.strip()]
+        return parts or None
+
+    parser.add_argument("--report-dir", default="reports", help="Directory to write audit reports")
+    parser.add_argument("--require-account-id", action="store_true", help="Fail if any configured account is missing an account ID")
+    parser.add_argument("--account", default=None, help="Comma-separated account names to target")
+    parser.add_argument("--zone", default=None, help="Comma-separated zone names or IDs to target")
+    parser.add_argument("--include", default=None, help="Regex: only record names matching this are included")
+    parser.add_argument("--exclude", default=None, help="Regex: record names matching this are excluded")
+
     # Disable subcommand
     disable_parser = subparsers.add_parser("disable", help="Disable proxies for all hostnames")
     disable_parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without making changes")
@@ -425,13 +626,32 @@ def main():
     
     # Initialize the manager
     manager = CloudflareProxyManager()
+
+    selected_accounts = _split_multi(getattr(args, "account", None))
+    selected_zones = _split_multi(getattr(args, "zone", None))
+    include = getattr(args, "include", None)
+    exclude = getattr(args, "exclude", None)
+    report_dir = Path(getattr(args, "report_dir", "reports"))
+
+    if getattr(args, "require_account_id", False):
+        missing = [name for name, cfg in manager.accounts.items() if "account_id" not in cfg]
+        if missing:
+            console.print(f"[red]Error:[/] Missing account IDs for: {', '.join(missing)}")
+            raise SystemExit(2)
     
     if args.command == "disable":
         console.print("[bold blue]Scanning and disabling proxies...[/]")
         if args.dry_run:
             console.print("[yellow]Dry run mode - no changes will be made[/]")
         
-        results = manager.scan_and_disable_proxies(dry_run=args.dry_run)
+        results = manager.scan_and_disable_proxies(
+            dry_run=args.dry_run,
+            selected_accounts=selected_accounts,
+            selected_zones=selected_zones,
+            include=include,
+            exclude=exclude,
+        )
+        manager._write_report_files(report_dir, results, "disable")
         
         console.print("\n[bold]Summary:[/]")
         console.print(f"Total records that would be modified: [bold]{results['total_changes']}[/]")
@@ -443,7 +663,15 @@ def main():
         if args.dry_run:
             console.print("[yellow]Dry run mode - no changes will be made[/]")
         
-        results = manager.restore_proxies(dry_run=args.dry_run)
+        results = manager.restore_proxies(
+            dry_run=args.dry_run,
+            selected_accounts=selected_accounts,
+            selected_zones=selected_zones,
+            include=include,
+            exclude=exclude,
+        )
+        if "error" not in results:
+            manager._write_report_files(report_dir, results, "restore")
         
         if "error" in results:
             console.print(f"[red]Error:[/] {results['error']}")

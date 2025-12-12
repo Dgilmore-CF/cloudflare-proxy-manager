@@ -48,12 +48,35 @@ A Python script to manage Cloudflare proxy settings across multiple accounts. Th
 
 ## Usage
 
+All commands support additional global options to scope and audit changes:
+
+```bash
+--report-dir reports                 # where audit reports are written (default: reports)
+--require-account-id                 # fail if any configured account is missing an account ID
+--account production,staging         # limit to specific configured account names
+--zone example.com,deadbeefzoneid    # limit to specific zone names or zone IDs
+--include '^api\.'                   # regex include filter for record names
+--exclude '\.internal\.'             # regex exclude filter for record names
+```
+
 ### Disable Proxies
 
 To disable proxies for all hostnames across all accounts:
 
 ```bash
 python cloudflare_proxy_manager.py disable
+```
+
+Scope to a single account and zone:
+
+```bash
+python cloudflare_proxy_manager.py --account production --zone example.com disable
+```
+
+Require account IDs to be configured (recommended for safety):
+
+```bash
+python cloudflare_proxy_manager.py --require-account-id disable
 ```
 
 For a dry run (no changes will be made):
@@ -68,6 +91,12 @@ To restore proxies to their original state:
 
 ```bash
 python cloudflare_proxy_manager.py restore
+```
+
+Restore only matching records (regex filters apply to record names):
+
+```bash
+python cloudflare_proxy_manager.py --include '^api\.' restore
 ```
 
 For a dry run (no changes will be made):
@@ -126,6 +155,35 @@ To find your Cloudflare Account ID:
 ## Logging
 
 Detailed logs are stored in the `logs/` directory in JSON format for easy parsing and analysis.
+
+## Reporting
+
+Every `disable` and `restore` run writes audit reports to `--report-dir` (default: `reports/`):
+
+- `disable_*.json` / `restore_*.json`: full machine-readable results
+- `disable_*.csv` / `restore_*.csv`: flat change list (if any changes)
+- `disable_*.md` / `restore_*.md`: human-readable summary
+
+The JSON/CSV reports include fields like `account`, `account_id`, `zone`, `zone_id`, `record_name`, and `action`.
+
+## Development
+
+Install dev dependencies:
+
+```bash
+pip install -r requirements.txt
+pip install -r requirements-dev.txt
+```
+
+Run tests:
+
+```bash
+pytest -q
+```
+
+## CI
+
+GitHub Actions CI is configured in `.github/workflows/ci.yml` and runs tests on pushes and pull requests.
 
 ## Deployment to GitHub
 
