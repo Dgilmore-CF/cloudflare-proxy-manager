@@ -57,6 +57,11 @@ All commands support additional global options to scope and audit changes:
 --zone example.com,deadbeefzoneid    # limit to specific zone names or zone IDs
 --include '^api\.'                   # regex include filter for record names
 --exclude '\.internal\.'             # regex exclude filter for record names
+--tags api,prod                      # comma-separated tag strings to match against record fields
+--tag-fields name,content,comment    # which fields tags match against (default: name,content)
+--comment-on-disable 'disabled {record_name} at {timestamp}'
+                                    # set DNS record comment when disabling proxy (optional)
+--restore-original-comment           # when restoring proxy, restore original DNS record comment (if modified by script)
 ```
 
 ### Disable Proxies
@@ -71,6 +76,26 @@ Scope to a single account and zone:
 
 ```bash
 python cloudflare_proxy_manager.py --account production --zone example.com disable
+```
+
+Filter by tags (simple substring match) against record fields:
+
+```bash
+python cloudflare_proxy_manager.py --tags api,edge --tag-fields name disable --dry-run
+```
+
+Add a comment marker when disabling proxy:
+
+```bash
+python cloudflare_proxy_manager.py \
+  --comment-on-disable 'Proxy disabled by script at {timestamp} (acct={account} zone={zone} record={record_name})' \
+  disable
+```
+
+Restore proxy and restore the original DNS record comment (only if the script changed it):
+
+```bash
+python cloudflare_proxy_manager.py --restore-original-comment restore
 ```
 
 Require account IDs to be configured (recommended for safety):

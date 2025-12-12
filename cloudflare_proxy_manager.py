@@ -209,6 +209,36 @@ class CloudflareProxyManager:
             if re.search(exclude, name):
                 return False
         return True
+
+    def _matches_tag_filters(self, fields: Dict[str, Any], tags: Optional[List[str]], tag_fields: Optional[List[str]]) -> bool:
+        if not tags:
+            return True
+
+        tag_fields = tag_fields or ["name", "content"]
+        haystacks: List[str] = []
+        for f in tag_fields:
+            v = fields.get(f)
+            if v is None:
+                continue
+            haystacks.append(str(v))
+
+        if not haystacks:
+            return False
+
+        combined = "\n".join(haystacks).lower()
+        return any(t.lower() in combined for t in tags)
+
+    def _render_comment(self, template: str, *, account: str, account_id: str, zone: str, zone_id: str, record_name: str, record_id: str) -> str:
+        ts = datetime.utcnow().isoformat() + "Z"
+        return template.format(
+            timestamp=ts,
+            account=account,
+            account_id=account_id,
+            zone=zone,
+            zone_id=zone_id,
+            record_name=record_name,
+            record_id=record_id,
+        )
     
     def verify_account(self, account_name: str) -> Dict:
         """Verify account access and return account information."""
@@ -292,17 +322,26 @@ class CloudflareProxyManager:
         account_name: str, 
         zone_id: str, 
         record_id: str, 
-        proxied: bool
+        proxied: bool,
+        comment: Optional[str] = None,
     ) -> bool:
         """Update the proxy status of a DNS record."""
         cf = self._get_cloudflare_client(account_name)
         try:
             record = self._cf_call(lambda: cf.zones.dns_records.get(zone_id, record_id))
-            if record["proxied"] != proxied:
+
+            changed = False
+            if record.get("proxied") != proxied:
                 record["proxied"] = proxied
+                changed = True
+
+            if comment is not None and record.get("comment") != comment:
+                record["comment"] = comment
+                changed = True
+
+            if changed:
                 self._cf_call(lambda: cf.zones.dns_records.put(zone_id, record_id, data=record))
-                return True
-            return False
+            return changed
         except Exception as e:
             self.logger.error(f"Error updating record {record_id} in zone {zone_id}: {str(e)}")
             return False
@@ -314,6 +353,9 @@ class CloudflareProxyManager:
         selected_zones: Optional[List[str]] = None,
         include: Optional[str] = None,
         exclude: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        tag_fields: Optional[List[str]] = None,
+        comment_on_disable: Optional[str] = None,
     ) -> Dict:
         """Scan all zones and disable proxies, saving the original state."""
         results: Dict[str, Any] = {"accounts": {}, "total_changes": 0, "dry_run": dry_run, "changes": []}
@@ -358,6 +400,13 @@ class CloudflareProxyManager:
                         record_name = record["name"]
                         if not self._matches_name_filters(record_name, include, exclude):
                             continue
+
+                        if not self._matches_tag_filters(
+                            {"name": record_name, "content": record.get("content"), "comment": record.get("comment")},
+                            tags,
+                            tag_fields,
+                        ):
+                            continue
                         account_results["records_processed"] += 1
                         
                         # Save original state if not already saved
@@ -368,15 +417,33 @@ class CloudflareProxyManager:
                                 "type": record["type"],
                                 "content": record["content"],
                                 "proxied": record.get("proxied", False),
+                                "comment": record.get("comment"),
                                 "modified": False
                             }
                         )
                         
                         # Only process if proxy is enabled and not already modified
                         if record.get("proxied") and not record_state["modified"]:
+                            desired_comment = None
+                            comment_changed = False
+                            if comment_on_disable is not None:
+                                desired_comment = self._render_comment(
+                                    comment_on_disable,
+                                    account=account_name,
+                                    account_id=self.accounts[account_name].get("account_id", "N/A"),
+                                    zone=zone_name,
+                                    zone_id=zone_id,
+                                    record_name=record_name,
+                                    record_id=record_id,
+                                )
+                                if record_state.get("comment") != desired_comment:
+                                    record_state["comment_modified"] = True
+                                    record_state["comment_after"] = desired_comment
+                                    comment_changed = True
+
                             if not dry_run:
                                 success = self.update_dns_record_proxy_status(
-                                    account_name, zone_id, record_id, False
+                                    account_name, zone_id, record_id, False, comment=desired_comment
                                 )
                                 if success:
                                     record_state["modified"] = True
@@ -394,6 +461,8 @@ class CloudflareProxyManager:
                                         "content": record["content"],
                                         "proxied_before": True,
                                         "proxied_after": False,
+                                        "comment_before": record_state.get("comment"),
+                                        "comment_after": desired_comment,
                                         "timestamp": datetime.utcnow().isoformat() + "Z",
                                     })
                                     self.logger.info(
@@ -424,6 +493,8 @@ class CloudflareProxyManager:
                                     "content": record["content"],
                                     "proxied_before": True,
                                     "proxied_after": False,
+                                    "comment_before": record_state.get("comment"),
+                                    "comment_after": desired_comment,
                                     "timestamp": datetime.utcnow().isoformat() + "Z",
                                 })
                                 self.logger.info(
@@ -454,6 +525,8 @@ class CloudflareProxyManager:
         selected_zones: Optional[List[str]] = None,
         include: Optional[str] = None,
         exclude: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        tag_fields: Optional[List[str]] = None,
     ) -> Dict:
         """Restore proxies based on saved state."""
         if not self.state_file.exists():
@@ -498,16 +571,29 @@ class CloudflareProxyManager:
                         record_name = record_data.get("name", "")
                         if not self._matches_name_filters(record_name, include, exclude):
                             continue
+
+                        if not self._matches_tag_filters(
+                            {"name": record_name, "content": record_data.get("content"), "comment": record_data.get("comment")},
+                            tags,
+                            tag_fields,
+                        ):
+                            continue
                         if record_data.get("modified") and record_data.get("proxied"):
+                            desired_comment = None
+                            if restore_original_comment and record_data.get("comment_modified"):
+                                desired_comment = record_data.get("comment")
                             if not dry_run:
                                 try:
                                     success = self.update_dns_record_proxy_status(
-                                        account_name, zone_id, record_id, True
+                                        account_name, zone_id, record_id, True, comment=desired_comment
                                     )
                                     if success:
                                         record_data["modified"] = False
                                         account_results["records_restored"] += 1
                                         results["total_restored"] += 1
+                                        if restore_original_comment and record_data.get("comment_modified"):
+                                            record_data["comment_modified"] = False
+                                            record_data.pop("comment_after", None)
                                         results["changes"].append({
                                             "action": "restore_proxy",
                                             "account": account_name,
@@ -520,6 +606,8 @@ class CloudflareProxyManager:
                                             "content": record_data.get("content"),
                                             "proxied_before": False,
                                             "proxied_after": True,
+                                            "comment_before": record_data.get("comment_after"),
+                                            "comment_after": desired_comment,
                                             "timestamp": datetime.utcnow().isoformat() + "Z",
                                         })
                                         self.logger.info(
@@ -561,6 +649,8 @@ class CloudflareProxyManager:
                                     "content": record_data.get("content"),
                                     "proxied_before": False,
                                     "proxied_after": True,
+                                    "comment_before": record_data.get("comment_after"),
+                                    "comment_after": desired_comment,
                                     "timestamp": datetime.utcnow().isoformat() + "Z",
                                 })
                                 self.logger.info(
@@ -601,12 +691,27 @@ def main():
         parts = [p.strip() for p in v.split(",") if p.strip()]
         return parts or None
 
+    def _split_tags(v: Optional[str]) -> Optional[List[str]]:
+        return _split_multi(v)
+
     parser.add_argument("--report-dir", default="reports", help="Directory to write audit reports")
     parser.add_argument("--require-account-id", action="store_true", help="Fail if any configured account is missing an account ID")
     parser.add_argument("--account", default=None, help="Comma-separated account names to target")
     parser.add_argument("--zone", default=None, help="Comma-separated zone names or IDs to target")
     parser.add_argument("--include", default=None, help="Regex: only record names matching this are included")
     parser.add_argument("--exclude", default=None, help="Regex: record names matching this are excluded")
+    parser.add_argument("--tags", default=None, help="Comma-separated tag strings to match against DNS record fields")
+    parser.add_argument("--tag-fields", default="name,content", help="Comma-separated fields to match tags against (name,content,comment)")
+    parser.add_argument(
+        "--comment-on-disable",
+        default=None,
+        help="Set DNS record comment when disabling proxy. Template supports {timestamp},{account},{account_id},{zone},{zone_id},{record_name},{record_id}",
+    )
+    parser.add_argument(
+        "--restore-original-comment",
+        action="store_true",
+        help="When restoring proxy, restore the original DNS record comment if it was modified by this script",
+    )
 
     # Disable subcommand
     disable_parser = subparsers.add_parser("disable", help="Disable proxies for all hostnames")
@@ -631,7 +736,11 @@ def main():
     selected_zones = _split_multi(getattr(args, "zone", None))
     include = getattr(args, "include", None)
     exclude = getattr(args, "exclude", None)
+    tags = _split_tags(getattr(args, "tags", None))
+    tag_fields = _split_multi(getattr(args, "tag_fields", "name,content"))
     report_dir = Path(getattr(args, "report_dir", "reports"))
+    comment_on_disable = getattr(args, "comment_on_disable", None)
+    restore_original_comment = bool(getattr(args, "restore_original_comment", False))
 
     if getattr(args, "require_account_id", False):
         missing = [name for name, cfg in manager.accounts.items() if "account_id" not in cfg]
@@ -650,6 +759,9 @@ def main():
             selected_zones=selected_zones,
             include=include,
             exclude=exclude,
+            tags=tags,
+            tag_fields=tag_fields,
+            comment_on_disable=comment_on_disable,
         )
         manager._write_report_files(report_dir, results, "disable")
         
@@ -669,6 +781,9 @@ def main():
             selected_zones=selected_zones,
             include=include,
             exclude=exclude,
+            tags=tags,
+            tag_fields=tag_fields,
+            restore_original_comment=restore_original_comment,
         )
         if "error" not in results:
             manager._write_report_files(report_dir, results, "restore")
