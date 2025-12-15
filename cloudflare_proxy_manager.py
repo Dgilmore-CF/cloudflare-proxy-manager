@@ -11,16 +11,16 @@ import logging
 import csv
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import cloudflare
+import CloudFlare as cloudflare
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.progress import Progress
-from python_json_logger import JsonFormatter
+from pythonjsonlogger.jsonlogger import JsonFormatter
 
 # Initialize console for rich output
 console = Console()
@@ -95,11 +95,11 @@ class CloudflareProxyManager:
                     return json.load(f)
                 except json.JSONDecodeError:
                     self.logger.warning("State file is corrupted, starting with empty state")
-        return {"version": 1, "accounts": {}, "last_updated": datetime.utcnow().isoformat()}
+        return {"version": 1, "accounts": {}, "last_updated": datetime.now(timezone.utc).isoformat()}
     
     def _save_state(self):
         """Save the current proxy state to the state file."""
-        self.state["last_updated"] = datetime.utcnow().isoformat()
+        self.state["last_updated"] = datetime.now(timezone.utc).isoformat()
         with open(self.state_file, 'w') as f:
             json.dump(self.state, f, indent=2)
     
@@ -112,7 +112,7 @@ class CloudflareProxyManager:
     
     def _write_report_files(self, report_dir: Path, results: Dict[str, Any], prefix: str) -> None:
         report_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
         report_json = report_dir / f"{prefix}_{ts}.json"
         with open(report_json, "w") as f:
@@ -130,7 +130,7 @@ class CloudflareProxyManager:
         report_md = report_dir / f"{prefix}_{ts}.md"
         with open(report_md, "w") as f:
             f.write(f"# Cloudflare Proxy Manager Report\n\n")
-            f.write(f"Generated: {datetime.utcnow().isoformat()}Z\n\n")
+            f.write(f"Generated: {datetime.now(timezone.utc).isoformat()}\n\n")
             f.write(f"Action: {prefix}\n\n")
             f.write(f"Total changes: {results.get('total_changes', results.get('total_restored', 0))}\n\n")
             f.write("## Accounts\n\n")
@@ -229,7 +229,7 @@ class CloudflareProxyManager:
         return any(t.lower() in combined for t in tags)
 
     def _render_comment(self, template: str, *, account: str, account_id: str, zone: str, zone_id: str, record_name: str, record_id: str) -> str:
-        ts = datetime.utcnow().isoformat() + "Z"
+        ts = datetime.now(timezone.utc).isoformat()
         return template.format(
             timestamp=ts,
             account=account,
@@ -463,7 +463,7 @@ class CloudflareProxyManager:
                                         "proxied_after": False,
                                         "comment_before": record_state.get("comment"),
                                         "comment_after": desired_comment,
-                                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
                                     })
                                     self.logger.info(
                                         f"Disabled proxy for {record_name} ({record['type']} {record['content']})",
@@ -495,7 +495,7 @@ class CloudflareProxyManager:
                                     "proxied_after": False,
                                     "comment_before": record_state.get("comment"),
                                     "comment_after": desired_comment,
-                                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
                                 })
                                 self.logger.info(
                                     f"[DRY RUN] Would disable proxy for {record_name} ({record['type']} {record['content']})",
@@ -527,6 +527,7 @@ class CloudflareProxyManager:
         exclude: Optional[str] = None,
         tags: Optional[List[str]] = None,
         tag_fields: Optional[List[str]] = None,
+        restore_original_comment: bool = False,
     ) -> Dict:
         """Restore proxies based on saved state."""
         if not self.state_file.exists():
@@ -608,7 +609,7 @@ class CloudflareProxyManager:
                                             "proxied_after": True,
                                             "comment_before": record_data.get("comment_after"),
                                             "comment_after": desired_comment,
-                                            "timestamp": datetime.utcnow().isoformat() + "Z",
+                                            "timestamp": datetime.now(timezone.utc).isoformat(),
                                         })
                                         self.logger.info(
                                             f"Restored proxy for {record_data['name']} ({record_data['type']} {record_data['content']})",
@@ -651,7 +652,7 @@ class CloudflareProxyManager:
                                     "proxied_after": True,
                                     "comment_before": record_data.get("comment_after"),
                                     "comment_after": desired_comment,
-                                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
                                 })
                                 self.logger.info(
                                     f"[DRY RUN] Would restore proxy for {record_data['name']} ({record_data['type']} {record_data['content']})",
